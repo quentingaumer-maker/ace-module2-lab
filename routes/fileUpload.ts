@@ -29,9 +29,9 @@ async function extractZipBuffer (buffer: Buffer) {
   for (const entry of directory.files) {
     const fileName = entry.path
     const absolutePath = path.resolve('uploads/complaints/' + fileName)
-    challengeUtils.solveIf(challenges.fileWriteChallenge, () => { return absolutePath === path.resolve('ftp/legal.md') })
-    if (absolutePath.includes(path.resolve('.'))) {
-      await pipeline(entry.stream(), fs.createWriteStream('uploads/complaints/' + fileName))
+    if (absolutePath.startsWith(path.resolve('uploads/complaints') + path.sep)) {
+      challengeUtils.solveIf(challenges.fileWriteChallenge, () => { return absolutePath === path.resolve('ftp/legal.md') })
+      await pipeline(entry.stream(), fs.createWriteStream(absolutePath))
     }
   }
 }
@@ -67,14 +67,54 @@ function checkFileType ({ file }: Request, res: Response, next: NextFunction) {
   next()
 }
 
+function hasXxe (xml: string): boolean {
+  if (/<\s*xi:include\b/i.test(xml)) {
+    return true
+  }
+  if (/<!\s*ENTITY\b[^>]*\b(?:SYSTEM|PUBLIC)\b/i.test(xml)) {
+    return true
+  }
+  const doctypeStart = xml.search(/<!\s*DOCTYPE\b/i)
+  if (doctypeStart !== -1) {
+    const afterDoctype = xml.slice(doctypeStart)
+    const bracketIndex = afterDoctype.indexOf('[')
+    const closeAngle = afterDoctype.indexOf('>')
+    if (bracketIndex !== -1 && (closeAngle === -1 || bracketIndex < closeAngle)) {
+      const closeBracket = afterDoctype.match(/\]\s*>/)
+      if (closeBracket?.index !== undefined) {
+        const dtd = afterDoctype.slice(0, closeBracket.index + closeBracket[0].length)
+        if (/\b(?:SYSTEM|PUBLIC)\b/i.test(dtd)) {
+          return true
+        }
+      }
+    } else if (closeAngle !== -1) {
+      const dtd = afterDoctype.slice(0, closeAngle + 1)
+      if (/\b(?:SYSTEM|PUBLIC)\b/i.test(dtd)) {
+        return true
+      }
+    } else {
+      if (/\b(?:SYSTEM|PUBLIC)\b/i.test(afterDoctype)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 async function handleXmlUpload ({ file }: Request, res: Response, next: NextFunction) {
   if (utils.endsWith(file?.originalname.toLowerCase(), '.xml')) {
     challengeUtils.solveIf(challenges.deprecatedInterfaceChallenge, () => { return true })
     if (((file?.buffer) != null) && utils.isChallengeEnabled(challenges.deprecatedInterfaceChallenge)) { // XXE attacks in Docker/Heroku containers regularly cause "segfault" crashes
       const data = file.buffer.toString()
       try {
+        if (hasXxe(data)) {
+          throw new Error('External entity references are not allowed')
+        }
         const xmlString = await parseXmlString(data)
         challengeUtils.solveIf(challenges.xxeFileDisclosureChallenge, () => { return (utils.matchesEtcPasswdFile(xmlString) || utils.matchesSystemIniFile(xmlString)) })
+        if (utils.matchesEtcPasswdFile(xmlString) || utils.matchesSystemIniFile(xmlString)) {
+          throw new Error('External entity references are not allowed')
+        }
         res.status(410)
         next(new Error('B2B customer complaints via file upload have been deprecated for security reasons: ' + utils.trunc(xmlString, 400) + ' (' + file.originalname + ')'))
       } catch (err: unknown) {
